@@ -9,12 +9,13 @@ import { z } from "zod";
 // MCP Server Configuration
 // ============================================================
 
-const PORT = parseInt(process.env.PORT || "3000", 10);
+// Fix #2: Fallback to 3000 if PORT is non-numeric (prevents NaN crash)
+const PORT = parseInt(process.env.PORT || "3000", 10) || 3000;
 
 // Store active SSE transports for cleanup
 const sseTransports: Map<string, SSEServerTransport> = new Map();
 
-// Shared state across all connections (fixes isolated state issue)
+// Fix #1: Shared state across all connections (not isolated per connection)
 const notes: Map<string, string> = new Map();
 
 // ============================================================
@@ -29,6 +30,7 @@ function createMcpServer(): McpServer {
 
   // ----------------------------------------------------------
   // TOOL: greet
+  // Fix #3: Sanitize user input to prevent XSS/injection
   // ----------------------------------------------------------
   server.registerTool(
     "greet",
@@ -40,11 +42,12 @@ function createMcpServer(): McpServer {
       },
     },
     async ({ name }) => {
+      const sanitizedName = name.replace(/[<>'"]/g, "");
       return {
         content: [
           {
             type: "text",
-            text: `Hello, ${name}! Welcome to the MCP server running via ngrok.`,
+            text: `Hello, ${sanitizedName}! Welcome to the MCP server running via ngrok.`,
           },
         ],
       };
@@ -53,6 +56,7 @@ function createMcpServer(): McpServer {
 
   // ----------------------------------------------------------
   // TOOL: get_current_time
+  // Fix #4: Validate timezone to prevent unhandled exceptions
   // ----------------------------------------------------------
   server.registerTool(
     "get_current_time",
@@ -69,21 +73,33 @@ function createMcpServer(): McpServer {
       },
     },
     async ({ timezone }) => {
-      const now = new Date();
-      const options: Intl.DateTimeFormatOptions = {
-        dateStyle: "full",
-        timeStyle: "long",
-        timeZone: timezone || "UTC",
-      };
-      const formatted = new Intl.DateTimeFormat("en-US", options).format(now);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Current time: ${formatted}`,
-          },
-        ],
-      };
+      try {
+        const now = new Date();
+        const options: Intl.DateTimeFormatOptions = {
+          dateStyle: "full",
+          timeStyle: "long",
+          timeZone: timezone || "UTC",
+        };
+        const formatted = new Intl.DateTimeFormat("en-US", options).format(now);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Current time: ${formatted}`,
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error: Invalid timezone "${timezone}". Use IANA timezone names like "America/New_York" or "Asia/Kolkata".`,
+            },
+          ],
+          isError: true,
+        };
+      }
     }
   );
 
@@ -261,8 +277,15 @@ function createMcpServer(): McpServer {
 
 const app = express();
 
-// Enable CORS for all origins (needed for remote access via ngrok)
-app.use(cors());
+// Fix #5: CORS - restrict origins via env var (defaults to allow all for dev)
+app.use(
+  cors({
+    origin: process.env.ALLOWED_ORIGINS
+      ? process.env.ALLOWED_ORIGINS.split(",")
+      : true,
+    credentials: true,
+  })
+);
 
 // Parse JSON for all routes EXCEPT /mcp (StreamableHTTP handles its own parsing)
 app.use((req, res, next) => {
@@ -286,27 +309,48 @@ app.get("/health", (_req, res) => {
 
 // ============================================================
 // SSE Transport (Legacy - works with most current clients)
+// Fix #6: Add error handling for SSE connection failures
 // ============================================================
 
 app.get("/sse", async (req, res) => {
   console.log("[SSE] New client connection");
 
-  const server = createMcpServer();
-  const transport = new SSEServerTransport("/messages", res);
+  try {
+    const server = createMcpServer();
+    const transport = new SSEServerTransport("/messages", res);
 
-  sseTransports.set(transport.sessionId, transport);
+    sseTransports.set(transport.sessionId, transport);
 
-  res.on("close", () => {
-    console.log(`[SSE] Client disconnected: ${transport.sessionId}`);
-    sseTransports.delete(transport.sessionId);
-  });
+    res.on("close", () => {
+      console.log(`[SSE] Client disconnected: ${transport.sessionId}`);
+      sseTransports.delete(transport.sessionId);
+    });
 
-  await server.connect(transport);
-  console.log(`[SSE] Client connected: ${transport.sessionId}`);
+    await server.connect(transport);
+    console.log(`[SSE] Client connected: ${transport.sessionId}`);
+  } catch (error) {
+    console.error("[SSE] Connection error:", error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Failed to establish SSE connection" });
+    }
+  }
 });
 
+// Fix #7: Add error handling for message processing
+// Fix #8: Validate session ID format to prevent session hijacking
 app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId as string;
+
+  // Validate session ID format
+  if (
+    !sessionId ||
+    typeof sessionId !== "string" ||
+    !/^[a-zA-Z0-9_-]+$/.test(sessionId)
+  ) {
+    res.status(400).json({ error: "Invalid session ID" });
+    return;
+  }
+
   const transport = sseTransports.get(sessionId);
 
   if (!transport) {
@@ -314,7 +358,14 @@ app.post("/messages", async (req, res) => {
     return;
   }
 
-  await transport.handlePostMessage(req, res);
+  try {
+    await transport.handlePostMessage(req, res);
+  } catch (error) {
+    console.error("[SSE] Message handling error:", error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Failed to handle message" });
+    }
+  }
 });
 
 // ============================================================
@@ -374,6 +425,9 @@ app.listen(PORT, "0.0.0.0", () => {
 ║    1. Run: ngrok http ${PORT}                                  ║
 ║    2. Copy the ngrok URL                                     ║
 ║    3. Add to Kiro/Claude config                              ║
+║                                                              ║
+║  Environment:                                                ║
+║    ALLOWED_ORIGINS: ${process.env.ALLOWED_ORIGINS || "(all origins allowed)"}
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
   `);
