@@ -14,6 +14,9 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 // Store active SSE transports for cleanup
 const sseTransports: Map<string, SSEServerTransport> = new Map();
 
+// Shared state across all connections (fixes isolated state issue)
+const notes: Map<string, string> = new Map();
+
 // ============================================================
 // Create MCP Server Instance
 // ============================================================
@@ -136,8 +139,9 @@ function createMcpServer(): McpServer {
 
   // ----------------------------------------------------------
   // TOOL: notes (save, get, list)
+  // Uses shared `notes` Map defined at module level so state
+  // persists across all SSE/HTTP connections.
   // ----------------------------------------------------------
-  const notes: Map<string, string> = new Map();
 
   server.registerTool(
     "save_note",
